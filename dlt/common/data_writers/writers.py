@@ -307,8 +307,8 @@ class InsertValuesWriter(DataWriter):
             file_extension="insert_values",
             is_binary_format=False,
             supports_schema_changes="Buffer",
-            supports_compression=True,
             requires_destination_capabilities=True,
+            supports_compression=True,
         )
 
 
@@ -377,9 +377,13 @@ class ParquetDataWriter(DataWriter):
         self.schema = columns_to_arrow(
             columns_schema, self._caps, self.parquet_format.timestamp_timezone
         )
-        # find row items that are of the json type (could be abstracted out for use in other writers?)
+        # Native nested json columns are represented as Arrow struct/map/list values and must
+        # remain structured. Only stringify json columns whose Arrow representation is text.
         self.nested_indices = [
-            i for i, field in columns_schema.items() if field["data_type"] == "json"
+            i
+            for i, field in columns_schema.items()
+            if field["data_type"] == "json"
+            and not (field.get("x-nested-type") and self._caps.supports_nested_types)
         ]
         self.writer = self._create_writer(self.schema)
 
@@ -513,7 +517,6 @@ class CsvWriter(DataWriter):
         self.encoding = encoding
         self.encoding_errors = encoding_errors
         self.bytes_encoding = bytes_encoding
-        self._text_f: Optional[io.TextIOWrapper] = None
 
     def write_header(self, columns_schema: TTableSchemaColumns) -> None:
         self._columns_schema = columns_schema
