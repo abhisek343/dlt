@@ -307,8 +307,8 @@ class InsertValuesWriter(DataWriter):
             file_extension="insert_values",
             is_binary_format=False,
             supports_schema_changes="Buffer",
-            requires_destination_capabilities=True,
             supports_compression=True,
+            requires_destination_capabilities=True,
         )
 
 
@@ -517,6 +517,7 @@ class CsvWriter(DataWriter):
         self.encoding = encoding
         self.encoding_errors = encoding_errors
         self.bytes_encoding = bytes_encoding
+        self._text_f: Optional[io.TextIOWrapper] = None
 
     def write_header(self, columns_schema: TTableSchemaColumns) -> None:
         self._columns_schema = columns_schema
