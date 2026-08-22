@@ -1,7 +1,8 @@
 import functools
 import os
+from contextlib import contextmanager
 from tempfile import gettempdir
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
 from tenacity import (
     retry_if_exception,
@@ -99,6 +100,10 @@ class PipelineTasksGroup(TaskGroup):
 
         The load info and trace info can be optionally saved to the destination. See https://dlthub.com/docs/running-in-production/running#inspect-and-save-the-load-info-and-trace
 
+        When used as a context manager, parse-time pipeline working folders registered by
+        `run` or `add_run` are removed on context exit when `wipe_local_data` is enabled.
+        Legacy usage without an outer context keeps its existing lifecycle behavior.
+
         Args:
             pipeline_name (str): Name of the task group
             use_data_folder (bool, optional): If well defined 'data' folder is present it will be used. Currently only data folder on Composer is supported. Defaults to False.
@@ -120,6 +125,9 @@ class PipelineTasksGroup(TaskGroup):
 
         super().__init__(group_id=pipeline_name, **kwargs)
         self._used_names: Dict[str, Any] = {}
+        self._cleanup_context_depth = 0
+        self._internal_task_group_context_depth = 0
+        self._pipelines_for_cleanup: Dict[str, Pipeline] = {}
         self.use_task_logger = use_task_logger
         self.log_progress_period = log_progress_period
         self.buffer_max_items = buffer_max_items
@@ -151,6 +159,53 @@ class PipelineTasksGroup(TaskGroup):
         # reload config providers (TODO: inject Airflow run context)
         if PluggableRunContext in Container():
             Container()[PluggableRunContext].reload_providers()
+
+    def __enter__(self) -> "PipelineTasksGroup":
+        external_context = self._internal_task_group_context_depth == 0
+        if external_context:
+            self._cleanup_context_depth += 1
+        try:
+            return super().__enter__()
+        except Exception:
+            if external_context:
+                self._cleanup_context_depth -= 1
+            raise
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> Any:
+        external_context = self._internal_task_group_context_depth == 0
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            if external_context:
+                self._cleanup_context_depth -= 1
+                if self._cleanup_context_depth == 0:
+                    self._cleanup_registered_pipelines()
+
+    @contextmanager
+    def _task_group_context(self) -> Iterator[None]:
+        """Enter this TaskGroup for legacy add_run calls without triggering parse cleanup."""
+        if self._cleanup_context_depth > 0:
+            yield
+            return
+
+        self._internal_task_group_context_depth += 1
+        try:
+            with self:
+                yield
+        finally:
+            self._internal_task_group_context_depth -= 1
+
+    def _register_pipeline_for_cleanup(self, pipeline: Pipeline) -> None:
+        if self.wipe_local_data and self._cleanup_context_depth > 0:
+            self._pipelines_for_cleanup[pipeline.working_dir] = pipeline
+
+    def _cleanup_registered_pipelines(self) -> None:
+        pipelines = tuple(self._pipelines_for_cleanup.items())
+        self._pipelines_for_cleanup.clear()
+        for working_dir, pipeline in pipelines:
+            if os.path.exists(working_dir):
+                logger.info(f"Removing DAG parse-time pipeline folder {working_dir}")
+                pipeline._wipe_working_folder()
 
     def _task_name(self, pipeline: Pipeline, data: Any) -> str:
         """Generate a task name.
@@ -228,6 +283,7 @@ class PipelineTasksGroup(TaskGroup):
         Returns:
             PythonOperator: Airflow task instance.
         """
+        self._register_pipeline_for_cleanup(pipeline)
         f = functools.partial(
             self._run,
             pipeline,
@@ -455,7 +511,9 @@ class PipelineTasksGroup(TaskGroup):
                 f" random working directory set by PipelineTasksGroup in {DLT_DATA_DIR}."
             )
 
-        with self:
+        self._register_pipeline_for_cleanup(pipeline)
+
+        with self._task_group_context():
             # use factory function to make a task, in order to parametrize it
             # passing arguments to task function (_run) is serializing
             # them and running template engine on them
