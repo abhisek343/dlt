@@ -1,0 +1,284 @@
+diff --git a/dlt/helpers/airflow_helper.py b/dlt/helpers/airflow_helper.py
+index 3cc6750..5e5ccd8 100644
+--- a/dlt/helpers/airflow_helper.py
++++ b/dlt/helpers/airflow_helper.py
+@@ -1,7 +1,8 @@
+ import functools
+ import os
++from contextlib import contextmanager
+ from tempfile import gettempdir
+-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
++from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
+ 
+ from tenacity import (
+     retry_if_exception,
+@@ -99,6 +100,10 @@ class PipelineTasksGroup(TaskGroup):
+ 
+         The load info and trace info can be optionally saved to the destination. See https://dlthub.com/docs/running-in-production/running#inspect-and-save-the-load-info-and-trace
+ 
++        When used as a context manager, parse-time pipeline working folders registered by
++        `run` or `add_run` are removed on context exit when `wipe_local_data` is enabled.
++        Legacy usage without an outer context keeps its existing lifecycle behavior.
++
+         Args:
+             pipeline_name (str): Name of the task group
+             use_data_folder (bool, optional): If well defined 'data' folder is present it will be used. Currently only data folder on Composer is supported. Defaults to False.
+@@ -120,6 +125,9 @@ class PipelineTasksGroup(TaskGroup):
+ 
+         super().__init__(group_id=pipeline_name, **kwargs)
+         self._used_names: Dict[str, Any] = {}
++        self._cleanup_context_depth = 0
++        self._internal_task_group_context_depth = 0
++        self._pipelines_for_cleanup: Dict[str, Pipeline] = {}
+         self.use_task_logger = use_task_logger
+         self.log_progress_period = log_progress_period
+         self.buffer_max_items = buffer_max_items
+@@ -152,6 +160,53 @@ class PipelineTasksGroup(TaskGroup):
+         if PluggableRunContext in Container():
+             Container()[PluggableRunContext].reload_providers()
+ 
++    def __enter__(self) -> "PipelineTasksGroup":
++        external_context = self._internal_task_group_context_depth == 0
++        if external_context:
++            self._cleanup_context_depth += 1
++        try:
++            return super().__enter__()
++        except Exception:
++            if external_context:
++                self._cleanup_context_depth -= 1
++            raise
++
++    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> Any:
++        external_context = self._internal_task_group_context_depth == 0
++        try:
++            return super().__exit__(exc_type, exc_value, traceback)
++        finally:
++            if external_context:
++                self._cleanup_context_depth -= 1
++                if self._cleanup_context_depth == 0:
++                    self._cleanup_registered_pipelines()
++
++    @contextmanager
++    def _task_group_context(self) -> Iterator[None]:
++        """Enter this TaskGroup for legacy add_run calls without triggering parse cleanup."""
++        if self._cleanup_context_depth > 0:
++            yield
++            return
++
++        self._internal_task_group_context_depth += 1
++        try:
++            with self:
++                yield
++        finally:
++            self._internal_task_group_context_depth -= 1
++
++    def _register_pipeline_for_cleanup(self, pipeline: Pipeline) -> None:
++        if self.wipe_local_data and self._cleanup_context_depth > 0:
++            self._pipelines_for_cleanup[pipeline.working_dir] = pipeline
++
++    def _cleanup_registered_pipelines(self) -> None:
++        pipelines = tuple(self._pipelines_for_cleanup.items())
++        self._pipelines_for_cleanup.clear()
++        for working_dir, pipeline in pipelines:
++            if os.path.exists(working_dir):
++                logger.info(f"Removing DAG parse-time pipeline folder {working_dir}")
++                pipeline._wipe_working_folder()
++
+     def _task_name(self, pipeline: Pipeline, data: Any) -> str:
+         """Generate a task name.
+ 
+@@ -228,6 +283,7 @@ class PipelineTasksGroup(TaskGroup):
+         Returns:
+             PythonOperator: Airflow task instance.
+         """
++        self._register_pipeline_for_cleanup(pipeline)
+         f = functools.partial(
+             self._run,
+             pipeline,
+@@ -455,7 +511,9 @@ class PipelineTasksGroup(TaskGroup):
+                 f" random working directory set by PipelineTasksGroup in {DLT_DATA_DIR}."
+             )
+ 
+-        with self:
++        self._register_pipeline_for_cleanup(pipeline)
++
++        with self._task_group_context():
+             # use factory function to make a task, in order to parametrize it
+             # passing arguments to task function (_run) is serializing
+             # them and running template engine on them
+diff --git a/tests/helpers/airflow_tests/test_airflow_parse_cleanup.py b/tests/helpers/airflow_tests/test_airflow_parse_cleanup.py
+new file mode 100644
+index 0000000..18ce137
+--- /dev/null
++++ b/tests/helpers/airflow_tests/test_airflow_parse_cleanup.py
+@@ -0,0 +1,170 @@
++from pathlib import Path
++
++import pytest
++
++pytest.importorskip("airflow")
++
++from airflow import DAG
++
++import dlt
++from dlt.common import pendulum
++from dlt.helpers.airflow_helper import PipelineTasksGroup
++from dlt.pipeline.pipeline import Pipeline
++
++
++DEFAULT_DATE = pendulum.datetime(2023, 4, 18, tz="UTC")
++
++
++def _pipeline(name: str) -> Pipeline:
++    return dlt.pipeline(
++        pipeline_name=name,
++        dataset_name=f"{name}_dataset",
++        destination=dlt.destinations.duckdb(credentials=":pipeline:"),
++    )
++
++
++def _add_parse_marker(pipeline: Pipeline) -> Path:
++    working_dir = Path(pipeline.working_dir)
++    working_dir.mkdir(parents=True, exist_ok=True)
++    marker = working_dir / "dag-parse.marker"
++    marker.write_text("created while parsing the DAG")
++    return marker
++
++
++def test_context_cleans_parse_time_pipeline_and_task_still_runs(tmp_path: Path) -> None:
++    with DAG(
++        dag_id="dlt_parse_cleanup_execution",
++        schedule=None,
++        start_date=DEFAULT_DATE,
++        catchup=False,
++    ) as dag:
++        with PipelineTasksGroup(
++            "cleanup_group", local_data_folder=str(tmp_path), wipe_local_data=True
++        ) as tasks:
++            pipeline = _pipeline("parse_cleanup_execution")
++            marker = _add_parse_marker(pipeline)
++            working_dir = Path(pipeline.working_dir)
++
++            tasks.add_run(
++                pipeline,
++                [{"id": 1}, {"id": 2}],
++                table_name="items",
++                decompose="none",
++            )
++            assert marker.exists()
++
++    assert not working_dir.exists()
++
++    # The pipeline captured by the PythonOperator must still be usable after the
++    # parse-time working folder is removed. This exercises the actual task path.
++    dag.test()
++
++
++def test_context_cleans_multiple_registered_pipelines(tmp_path: Path) -> None:
++    with DAG(
++        dag_id="dlt_parse_cleanup_multiple",
++        schedule=None,
++        start_date=DEFAULT_DATE,
++        catchup=False,
++    ):
++        with PipelineTasksGroup(
++            "cleanup_group", local_data_folder=str(tmp_path), wipe_local_data=True
++        ) as tasks:
++            add_run_pipeline = _pipeline("parse_cleanup_add_run")
++            run_pipeline = _pipeline("parse_cleanup_run")
++            add_run_marker = _add_parse_marker(add_run_pipeline)
++            run_marker = _add_parse_marker(run_pipeline)
++
++            tasks.add_run(
++                add_run_pipeline,
++                [{"id": 1}],
++                table_name="items",
++                decompose="none",
++            )
++            tasks.run(run_pipeline, [{"id": 2}], table_name="items")
++
++            assert add_run_marker.exists()
++            assert run_marker.exists()
++
++    assert not add_run_marker.parent.exists()
++    assert not run_marker.parent.exists()
++
++
++def test_context_cleans_pipeline_when_dag_construction_fails(tmp_path: Path) -> None:
++    working_dir = None
++
++    with DAG(
++        dag_id="dlt_parse_cleanup_exception",
++        schedule=None,
++        start_date=DEFAULT_DATE,
++        catchup=False,
++    ):
++        with pytest.raises(RuntimeError, match="stop parsing"):
++            with PipelineTasksGroup(
++                "cleanup_group", local_data_folder=str(tmp_path), wipe_local_data=True
++            ) as tasks:
++                pipeline = _pipeline("parse_cleanup_exception")
++                marker = _add_parse_marker(pipeline)
++                working_dir = marker.parent
++                tasks.add_run(
++                    pipeline,
++                    [{"id": 1}],
++                    table_name="items",
++                    decompose="none",
++                )
++                raise RuntimeError("stop parsing")
++
++    assert working_dir is not None
++    assert not working_dir.exists()
++
++
++def test_context_respects_wipe_local_data_false(tmp_path: Path) -> None:
++    with DAG(
++        dag_id="dlt_parse_cleanup_disabled",
++        schedule=None,
++        start_date=DEFAULT_DATE,
++        catchup=False,
++    ):
++        with PipelineTasksGroup(
++            "cleanup_group", local_data_folder=str(tmp_path), wipe_local_data=False
++        ) as tasks:
++            pipeline = _pipeline("parse_cleanup_disabled")
++            marker = _add_parse_marker(pipeline)
++            tasks.add_run(
++                pipeline,
++                [{"id": 1}],
++                table_name="items",
++                decompose="none",
++            )
++
++    try:
++        assert marker.exists()
++    finally:
++        pipeline._wipe_working_folder()
++
++
++def test_legacy_add_run_does_not_change_parse_time_lifecycle(tmp_path: Path) -> None:
++    with DAG(
++        dag_id="dlt_parse_cleanup_legacy",
++        schedule=None,
++        start_date=DEFAULT_DATE,
++        catchup=False,
++    ):
++        tasks = PipelineTasksGroup(
++            "cleanup_group", local_data_folder=str(tmp_path), wipe_local_data=True
++        )
++        pipeline = _pipeline("parse_cleanup_legacy")
++        marker = _add_parse_marker(pipeline)
++        tasks.add_run(
++            pipeline,
++            [{"id": 1}],
++            table_name="items",
++            decompose="none",
++        )
++
++    try:
++        # add_run() keeps its historical internal TaskGroup context. Cleanup is
++        # opt-in through an explicit outer `with PipelineTasksGroup(...)` block.
++        assert marker.exists()
++    finally:
++        pipeline._wipe_working_folder()
